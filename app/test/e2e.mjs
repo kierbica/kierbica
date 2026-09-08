@@ -71,15 +71,25 @@ await step('default dataset loads', booted);
 console.log(`  ${await p.textContent('#fRows')} rows · query ${await p.textContent('#fQuery')} · ${await p.textContent('#fMem')}`);
 
 await step('grid actually paints pixels', async () => {
-  const lit = await p.evaluate(() => {
+  // The overlay hides as soon as the table lands, which can be a frame before
+  // the grid's first paint — so wait for pixels rather than sampling once.
+  const litPixels = () => p.evaluate(() => {
     const cv = document.querySelector('#gridCanvas');
+    if (!cv) return 0;
     const c = cv.getContext('2d');
     const d = c.getImageData(0, 0, Math.min(500, cv.width), Math.min(300, cv.height)).data;
     let n = 0;
     for (let i = 0; i < d.length; i += 4) if (d[i] > 40 || d[i + 1] > 40 || d[i + 2] > 40) n++;
     return n;
   });
-  if (lit < 500) throw new Error(`grid looks blank (${lit} lit px)`);
+  const deadline = Date.now() + 10000;
+  let lit = 0;
+  while (Date.now() < deadline) {
+    lit = await litPixels();
+    if (lit >= 500) return;
+    await p.waitForTimeout(100);
+  }
+  throw new Error(`grid looks blank (${lit} lit px)`);
 });
 
 await step('field list populated', async () => {

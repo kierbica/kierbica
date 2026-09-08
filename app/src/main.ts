@@ -1314,6 +1314,14 @@ store.onTable((t) => {
   grid.layout(t);
   grid.syncSpacer();
   resizeAll();
+
+  // Populate the counters from the table itself so the footer never flashes
+  // "0 rows" in the gap between the table landing and the first query result.
+  $('#pillRows').innerHTML = `<b>${int(t.nrows)}</b> <span class="dim">/ ${int(t.nrows)} rows</span>`;
+  $('#fRows').textContent = int(t.nrows);
+  $('#fMem').textContent = bytes(t.bytes);
+  $('#fQuery').textContent = '…';
+
   hideBoot();
   toast(`Loaded ${int(t.nrows)} rows × ${t.cols.length} cols in ${ms(S().loadMs)}`, 'ok');
 });
