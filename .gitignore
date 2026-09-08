@@ -4,3 +4,4 @@ app/shots/
 app/test/fixture.csv
 *.log
 .DS_Store
+app/*-tmp.mjs
