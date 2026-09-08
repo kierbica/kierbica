@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>Nebula — in-browser data studio</title>
+<meta name="description" content="Nebula is a zero-backend analytics workbench: load a million rows, filter, group and visualise them at 60fps, entirely in your browser." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%234dd0ff'/%3E%3Cstop offset='.5' stop-color='%23a06bff'/%3E%3Cstop offset='1' stop-color='%2337e2a0'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='9' fill='url(%23g)'/%3E%3Crect x='6' y='6' width='20' height='20' rx='5' fill='%230b0e15'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+<div id="app"></div>
+
+<div class="boot" id="boot">
+  <div class="boot-in">
+    <div class="boot-mark"></div>
+    <div class="boot-t">Nebula</div>
+    <div class="boot-s" id="bootMsg">initialising engine…</div>
+    <div class="boot-bar"><i id="bootBar"></i></div>
+  </div>
+</div>
+
+<div class="drop" id="drop">
+  <div class="drop-in">
+    <h3>Drop a CSV to analyse it</h3>
+    <p>Parsed locally in a Web Worker · nothing is uploaded</p>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div class="tip" id="tip"></div>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

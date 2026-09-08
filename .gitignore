@@ -1,0 +1,6 @@
+node_modules/
+dist/
+app/shots/
+app/test/fixture.csv
+*.log
+.DS_Store

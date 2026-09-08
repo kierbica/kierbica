@@ -1,0 +1,20 @@
+{
+  "name": "nebula",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --import ./test/register.mjs test/engine.test.mjs && node --experimental-strip-types --import ./test/register.mjs test/query.test.mjs",
+    "bench": "node --experimental-strip-types --import ./test/register.mjs test/bench.mjs",
+    "verify": "node verify.mjs && node verify2.mjs",
+    "e2e": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  },
+  "description": "In-browser data studio: a million rows, filtered, grouped and rendered at 60fps with zero backend."
+}
