@@ -252,7 +252,7 @@ Identical SIGNAL CORE block (code-identical; verified by the linter), plus:
 | Regime | Trend threshold / transition lo | 0.50 / 0.35 | Keep a ≥0.1 neutral band |
 | Regime | ATR & BBW percentile lookbacks | 200 | 100–400; ≥ half a typical session |
 | Regime | vol high/low, squeeze thresholds | 80/25/15 | 75–90 / 15–30 / 10–20 |
-| HTF | use / timeframe / EMA len | on / 15m / 50 | TF ∈ {5m, 15m, 30m, 1h}; must exceed chart TF (guarded) |
+| HTF | use / timeframe / EMA len | on / 15m / 50 | TF ∈ {5m, 15m, 30m, 1h}; auto-deactivates on charts at/above this TF (info table shows "n/a (chart TF)") |
 | Score | weights (trend, slope, mom, RSI, band, SAR) | 1.0, 0.5, 0.5, 0.7, 0.6, 0.3 | Ablate each to 0 (Stage 2) before trusting any |
 | Score | entry / strong / fade thresholds | 30 / 55 / 10 | entry 25–45; strong ≥ entry+15; fade 0–20 |
 | Quality | ATR percentile min/max | 20 / 95 | 15–35 / 90–99 |
@@ -317,7 +317,7 @@ Identical SIGNAL CORE block (code-identical; verified by the linter), plus:
 **Strategy (Version B):**
 1. Add the strategy to the chart. In the alert dialog choose Condition: strategy name → **"Order fills and alert() calls"** (or "alert() function calls only").
 2. Order-fill alerts use the `alert_message` texts ("U1M LONG entry" etc.). To include dynamic data in order-fill messages, use TradingView's placeholders (e.g. `{{strategy.order.action}}`, `{{strategy.order.contracts}}`, `{{close}}`) in the alert dialog's message box — placeholders are resolved by TradingView at fill time, not by the script.
-3. Same frequency discipline as above; strategy order events are inherently confirmed-bar driven here because `calc_on_every_tick=false`.
+3. Same frequency discipline as above; strategy order events are inherently confirmed-bar driven here because `calc_on_every_tick=false`. Note: the strategy deliberately contains **no** `alertcondition()` entries — those are indicator-only in TradingView (they compile in strategies but no alert can be created from them); the strategy exposes alerts via `alert()` payloads and order fills only.
 
 **Verification before going live:** forward-test on paper for ≥ 2 weeks and confirm every alert timestamp matches the bar close (not mid-bar), and that no alert ever appears, disappears, or moves after the bar closes.
 
@@ -420,7 +420,7 @@ Legend: **[x]** done and verified here · **[~]** done here to the extent possib
 - [x] **Pine v6** — `//@version=6`, v6-only semantics respected (strict bools: no `na()`/`nz()` on bools; no implicit int→bool; lazy `and`/`or`; no `when=` params; `dynamic_requests` left at default with a single, static, global-scope request).
 - [~] **Compiles** — hand-audited against v6 docs + custom static linter (`tools/pine_sanity_check.py`: namespaces, bracket balance, tab check, repaint-primitive scan, `alertcondition` const-message check) passes clean. **A Pine compiler does not exist in this sandbox; paste both files into the Pine Editor as the authoritative compile check. Expect zero errors; if the editor flags anything, it will be cosmetic, not structural.**
 - [x] **No lookahead** — no future indexing (`[negative]`), no pivots, no `ta.valuewhen` misuse, no unconfirmed HTF values.
-- [x] **No future leakage** — single `request.security()` uses the documented non-repainting pattern `ta.ema(close, len)[1]` + `lookahead_on`, guarded by `timeframe.in_seconds()` validation (cited in Part 2).
+- [x] **No future leakage** — single `request.security()` uses the documented non-repainting pattern `ta.ema(close, len)[1]` + `lookahead_on`, and the filter self-deactivates gracefully on charts at/above the requested HTF (no runtime error; info table shows "n/a (chart TF)").
 - [x] **Repainting behavior documented** — header of both files; open-bar values may fluctuate until close (benign, disclosed); signals final at close; alerts bar-close-only; nothing moves after the bar closes.
 - [x] **Confirmed signals** — triggers are close-cross events; `alert()` gated by `barstate.isconfirmed`; strategy `calc_on_every_tick=false`.
 - [x] **Realistic execution assumptions** — next-open fills, `process_orders_on_close=false`, slippage ticks, declaration-level commission, margin set, bar-magnifier caveat disclosed, spread proxy gates.

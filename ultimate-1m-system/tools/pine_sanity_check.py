@@ -102,6 +102,15 @@ def check_file(path: Path) -> int:
             if indent % 4 != 0 and indent != 5 and not (indent > 4 and indent % 4 in (1, 2, 3)):
                 warns.append(f"{path.name}:{i}: unusual indent {indent} (continuation?) — verify: {stripped[:60]}")
 
+    # alertcondition() events are indicator-only: inert in strategies
+    if re.search(r"(?m)^\s*strategy\s*\(", src) and re.search(r"(?m)^\s*alertcondition\(", src):
+        errors.append(f"{path.name}: alertcondition() used in a strategy — indicator-only feature, no alert can be created from it")
+
+    # runtime.error guards crash the whole script; prefer graceful degradation
+    for i, raw in enumerate(lines, 1):
+        if re.search(r"\bruntime\.error\s*\(", strip_comments_strings(raw)):
+            warns.append(f"{path.name}:{i}: runtime.error() aborts the entire script — prefer graceful degradation: {raw.strip()[:60]}")
+
     # alertcondition messages must be const strings
     for m in re.finditer(r"alertcondition\([^,]+,\s*[^,]+,\s*([^)]+)\)", src):
         if not m.group(1).strip().startswith('"'):

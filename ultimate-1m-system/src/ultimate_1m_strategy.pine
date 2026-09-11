@@ -156,9 +156,13 @@ float atr    = ta.atr(atrLen)
 float psar   = ta.sar(psarStart, psarInc, psarMax)
 
 // ---- higher-timeframe bias: CONFIRMED value of last closed HTF bar ----------
-if useHTF and timeframe.in_seconds() >= timeframe.in_seconds(htfTf)
-    runtime.error("U1M: HTF timeframe must be higher than the chart timeframe.")
-float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+// Non-repainting pattern: expr[1] + lookahead_on (TradingView User Manual).
+// Graceful degradation: on charts at/above the requested HTF the filter
+// deactivates itself instead of erroring; info table shows "n/a (chart TF)".
+bool  htfUsable = timeframe.in_seconds(htfTf) >= timeframe.in_seconds()
+float htfEmaRaw = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+bool  htfActive = useHTF and htfUsable and not na(htfEmaRaw)
+float htfEma    = nz(htfEmaRaw, close)
 
 // ---- normalized components, each bounded to [-1, +1] ------------------------
 float atrSafe = atr > 0 ? atr : na
@@ -183,8 +187,8 @@ bool  bbwOk  = bbwPct >= minBbwPct
 string volStr = bbwPct <= squeezeTh ? "SQUEEZE" : atrPct >= volHighTh ? "HIGH VOL" : atrPct <= volLowTh ? "LOW VOL" : "NORMAL"
 
 // ---- Layer B · directional bias --------------------------------------------
-bool htfLongOk  = not useHTF or close > htfEma
-bool htfShortOk = not useHTF or close < htfEma
+bool htfLongOk  = not htfActive or close > htfEma
+bool htfShortOk = not htfActive or close < htfEma
 bool biasLongOk  = (isTrending ? cTrend > 0 : true) and htfLongOk
 bool biasShortOk = (isTrending ? cTrend < 0 : true) and htfShortOk
 
@@ -334,12 +338,16 @@ if flatAtSessionEnd and sessEnd and curSide != 0
 // ---- entries (full signals only; opposite entry reverses via FIFO netting) ---
 // The stop/target bracket is submitted at SIGNAL time together with the entry,
 // so it protects the position from the fill bar onward — exactly what a live
-// trader placing an OCO bracket after a bar-close alert would do. The per-bar
+// trader placing an OCO bracket after a bar-close alert would do. Signal-time
+// brackets are only submitted for GENUINE new/reversing positions, so they can
+// never silently modify the bracket of an already-open trade. The per-bar
 // update above ratchets the stop as break-even/trailing engage.
-if buySig and qtyOk
+bool wantLong  = buySig and qtyOk and curSide <= 0
+bool wantShort = sellSig and qtyOk and curSide >= 0
+if wantLong
     strategy.entry("L", strategy.long, qty = posQty, alert_message = "U1M LONG entry")
     strategy.exit("X-Long", "L", stop = pendStop, limit = pendTgt, alert_message = "U1M LONG exit")
-if sellSig and qtyOk
+if wantShort
     strategy.entry("S", strategy.short, qty = posQty, alert_message = "U1M SHORT entry")
     strategy.exit("X-Short", "S", stop = pendStop, limit = pendTgt, alert_message = "U1M SHORT exit")
 
@@ -355,17 +363,13 @@ plot(showLines and curSide != 0 ? tgtPx  : na, "Target", color.new(color.teal, 0
 bgcolor(showRegimeBG ? (isTrending ? color.new(cTrend >= 0 ? color.green : color.red, 92) : isTransition ? color.new(color.orange, 93) : color.new(color.blue, 94)) : na, title = "Regime")
 
 // -----------------------------------------------------------------------------
-// ALERTS — same architecture as the indicator, plus order-fill alert messages
+// ALERTS — strategies support alert() calls and order-fill alert messages.
+// alertcondition() events are indicator-only (in strategies they compile but no
+// alert can be created from them), so they are intentionally NOT used here.
+// For the classic per-condition alert dialog use the oscillator indicator.
 // -----------------------------------------------------------------------------
-alertcondition(buySig,     "U1M BUY",         "U1M BUY at bar close.")
-alertcondition(sellSig,    "U1M SELL",        "U1M SELL at bar close.")
-alertcondition(strongBuy,  "U1M BUY STRONG",  "U1M STRONG BUY at bar close.")
-alertcondition(strongSell, "U1M SELL STRONG", "U1M STRONG SELL at bar close.")
-alertcondition(fadeExitLong,  "U1M EXIT LONG (fade)",  "U1M long exit: score fade.")
-alertcondition(fadeExitShort, "U1M EXIT SHORT (fade)", "U1M short exit: score fade.")
-
 string tfStr = timeframe.period
-string alertPayload(string sig) =>
+alertPayload(string sig) =>
     '{"sys":"U1M","sym":"' + syminfo.ticker + '","tf":"' + tfStr + '","sig":"' + sig + '","score":' + str.tostring(score, "#.0") + ',"conf":' + str.tostring(conf, "#") + ',"regime":"' + regimeStr + '","vol":"' + volStr + '","px":' + str.tostring(close, format.mintick) + ',"atr":' + str.tostring(atr, format.mintick) + ',"stop":' + str.tostring(buySig or sellSig ? (buySig ? close - sugStopDist : close + sugStopDist) : na, format.mintick) + ',"target":' + str.tostring(buySig or sellSig ? (buySig ? close + sugStopDist * rrRatio : close - sugStopDist * rrRatio) : na, format.mintick) + ',"t":' + str.tostring(time) + '}'
 
 if barstate.isconfirmed

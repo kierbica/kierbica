@@ -138,11 +138,13 @@ float atr    = ta.atr(atrLen)
 float psar   = ta.sar(psarStart, psarInc, psarMax)
 
 // ---- higher-timeframe bias: CONFIRMED value of last closed HTF bar ----------
-// Documented non-repainting pattern: expr[1] + lookahead_on. Guard: HTF must be
-// higher than chart TF.
-if useHTF and timeframe.in_seconds() >= timeframe.in_seconds(htfTf)
-    runtime.error("U1M: HTF timeframe must be higher than the chart timeframe.")
-float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+// Non-repainting pattern: expr[1] + lookahead_on (TradingView User Manual).
+// Graceful degradation: on charts at/above the requested HTF the filter
+// deactivates itself instead of erroring; info table shows "n/a (chart TF)".
+bool  htfUsable = timeframe.in_seconds(htfTf) >= timeframe.in_seconds()
+float htfEmaRaw = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+bool  htfActive = useHTF and htfUsable and not na(htfEmaRaw)
+float htfEma    = nz(htfEmaRaw, close)
 
 // ---- normalized components, each bounded to [-1, +1] ------------------------
 float atrSafe = atr > 0 ? atr : na
@@ -167,8 +169,8 @@ bool  bbwOk  = bbwPct >= minBbwPct
 string volStr = bbwPct <= squeezeTh ? "SQUEEZE" : atrPct >= volHighTh ? "HIGH VOL" : atrPct <= volLowTh ? "LOW VOL" : "NORMAL"
 
 // ---- Layer B · directional bias --------------------------------------------
-bool htfLongOk  = not useHTF or close > htfEma   // vs last CONFIRMED HTF EMA
-bool htfShortOk = not useHTF or close < htfEma
+bool htfLongOk  = not htfActive or close > htfEma
+bool htfShortOk = not htfActive or close < htfEma
 bool biasLongOk  = (isTrending ? cTrend > 0 : true) and htfLongOk
 bool biasShortOk = (isTrending ? cTrend < 0 : true) and htfShortOk
 
@@ -302,7 +304,7 @@ alertcondition(fadeExitShort, "U1M EXIT SHORT (fade)", "U1M momentum-deteriorati
 alertcondition(isTrending and not isTrending[1] or isTransition and not isTransition[1], "U1M REGIME CHANGE", "U1M regime state changed at bar close.")
 
 string tfStr = timeframe.period
-string alertPayload(string sig) =>
+alertPayload(string sig) =>
     '{"sys":"U1M","sym":"' + syminfo.ticker + '","tf":"' + tfStr + '","sig":"' + sig + '","score":' + str.tostring(score, "#.0") + ',"conf":' + str.tostring(conf, "#") + ',"regime":"' + regimeStr + '","vol":"' + volStr + '","px":' + str.tostring(close, format.mintick) + ',"atr":' + str.tostring(atr, format.mintick) + ',"stop":' + str.tostring(buySig or sellSig ? (buySig ? close - sugStopDist : close + sugStopDist) : na, format.mintick) + ',"target":' + str.tostring(buySig or sellSig ? (buySig ? close + sugStopDist * rrRatio : close - sugStopDist * rrRatio) : na, format.mintick) + ',"t":' + str.tostring(time) + '}'
 
 if barstate.isconfirmed
