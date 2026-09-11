@@ -1,0 +1,316 @@
+//@version=6
+// =============================================================================
+//  ULTIMATE 1-MINUTE TRADING SYSTEM — VERSION A: OSCILLATOR / SIGNAL INDICATOR
+//  Composite regime-switching score  ·  Pine Script v6  ·  research build
+//
+//  WHAT THIS IS
+//    A hierarchical signal engine for 1-minute charts:
+//      Regime -> Bias -> Setup -> Confirmation -> Score -> Quality gate -> Signal
+//    The oscillator is a normalized composite score in [-100, +100].
+//
+//  NON-REPAINT CONTRACT
+//    * Every signal is computed from data available at bar close.
+//    * No future reference, no pivot lookups, no unconfirmed HTF data.
+//    * The single request.security() call uses the documented non-repainting
+//      pattern: expression offset by [1] with lookahead = lookahead_on.
+//      (TradingView User Manual, "Other timeframes and data -> Avoiding
+//      repainting" and "Concepts -> Repainting".)
+//    * While a bar is OPEN, the marker may appear/disappear as values update;
+//      it is only FINAL at bar close. Always alert on "Once Per Bar Close".
+//    * alert() calls are additionally gated with barstate.isconfirmed.
+//
+//  SIGNAL CORE SYNC
+//    The block between "SIGNAL CORE BEGIN/END" is shared with the companion
+//    strategy file (ultimate_1m_strategy.pine). Keep them byte-identical.
+//
+//  NO PERFORMANCE CLAIMS
+//    This code ships with DEFAULT parameters that are literature-standard
+//    starting points, not optimized results. Run the validation protocol in
+//    DELIVERABLE.md (Part 10) before trading anything. Historical performance
+//    does not guarantee future results.
+// =============================================================================
+
+indicator("Ultimate 1M System — Oscillator [Research]", "U1M-Osc", overlay = false, max_labels_count = 100, max_bars_back = 2000)
+
+// -----------------------------------------------------------------------------
+// INPUTS (only parameters with demonstrated logical roles are exposed)
+// -----------------------------------------------------------------------------
+string grpCore  = "1 · Core indicator lengths"
+string grpReg   = "2 · Regime engine"
+string grpHTF   = "3 · Higher-timeframe bias (confirmed)"
+string grpScore = "4 · Scoring engine"
+string grpQ     = "5 · Quality & false-signal filters"
+string grpSess  = "6 · Session filter"
+string grpRiskD = "7 · Risk reference (display & alerts only)"
+string grpUI    = "8 · Display"
+
+// — 1 · Core lengths (standard defaults from indicator literature; see Part 7)
+rsiLen     = input.int(14,    "RSI length",                    minval = 2,   maxval = 100, group = grpCore, tooltip = "Wilder RSI. Normalized momentum. In RANGE mode used contrarian, in TREND mode as momentum alignment.")
+bbLen      = input.int(20,    "Bollinger length",              minval = 5,   maxval = 200, group = grpCore)
+bbMult     = input.float(2.0, "Bollinger stdev multiplier",    minval = 0.5, maxval = 5.0, step = 0.1, group = grpCore)
+emaFastLen = input.int(21,    "Fast EMA length",               minval = 2,   maxval = 400, group = grpCore, tooltip = "Primary directional component. Spread vs slow EMA is ATR-normalized in the score.")
+emaSlowLen = input.int(55,    "Slow EMA length",               minval = 5,   maxval = 800, group = grpCore)
+momLen     = input.int(10,    "Momentum length",               minval = 2,   maxval = 100, group = grpCore, tooltip = "Used as a TURN confirmation (mom vs mom[1]), not as a level, to avoid duplicating RSI information.")
+atrLen     = input.int(14,    "ATR length",                    minval = 2,   maxval = 200, group = grpCore, tooltip = "ATR is used ONLY for normalization, regime and risk — never directionally.")
+psarStart  = input.float(0.02,"PSAR start",                    minval = 0.005, maxval = 0.1,  step = 0.005, group = grpCore)
+psarInc    = input.float(0.02,"PSAR increment",                minval = 0.005, maxval = 0.1,  step = 0.005, group = grpCore)
+psarMax    = input.float(0.2, "PSAR maximum",                  minval = 0.05,  maxval = 0.5,  step = 0.01,  group = grpCore, tooltip = "PSAR carries the lowest weight (high redundancy with EMA trend state). Set its weight to 0 to disable; ablation may justify removal.")
+
+// — 2 · Regime engine
+trendDiv   = input.float(1.6, "Trend-strength divisor (ATR units)", minval = 0.5, maxval = 4.0, step = 0.1, group = grpReg, tooltip = "trendMix = clamp(|cTrend| + |cSlope|) / divisor. Larger = harder to classify as trending.")
+trendMixTh = input.float(0.50,"Trend-mode threshold",               minval = 0.2, maxval = 0.9, step = 0.05, group = grpReg)
+transLo    = input.float(0.35,"Transition-zone lower bound",        minval = 0.0, maxval = 0.8, step = 0.05, group = grpReg, tooltip = "trendMix in [transLo, trendMixTh) = TRANSITION: regime evidence is contradictory.")
+volLookback  = input.int(200, "ATR percentile lookback",       minval = 50, maxval = 1000, group = grpReg)
+bbwLookback  = input.int(200, "BB-width percentile lookback",  minval = 50, maxval = 1000, group = grpReg)
+volHighTh    = input.float(80,"High-volatility percentile",    minval = 50, maxval = 100, group = grpReg)
+volLowTh     = input.float(25,"Low-volatility percentile",     minval = 0,  maxval = 60,  group = grpReg)
+squeezeTh    = input.float(15,"Squeeze percentile (BB width)", minval = 0,  maxval = 50,  group = grpReg)
+
+// — 3 · Higher-timeframe bias (confirmed, non-repainting)
+useHTF = input.bool(true, "Use confirmed HTF bias filter", group = grpHTF, tooltip = "Blocks trades against the last CONFIRMED higher-timeframe EMA position. Uses the documented non-repainting request.security() pattern (expr[1] + lookahead_on): value = last CLOSED HTF bar.")
+htfTf  = input.timeframe("15", "HTF timeframe",            group = grpHTF)
+htfLen = input.int(50,        "HTF EMA length",            minval = 2, maxval = 400, group = grpHTF)
+
+// — 4 · Scoring engine
+wTrend = input.float(1.0, "Weight · trend (EMA spread)",   minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wSlope = input.float(0.5, "Weight · MA slope",             minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wMom   = input.float(0.5, "Weight · momentum",             minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore, tooltip = "Deliberately modest: raw momentum largely duplicates RSI. Its main job is the turn-confirmation gate.")
+wRsi   = input.float(0.7, "Weight · RSI",                  minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wBand  = input.float(0.6, "Weight · band position",        minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wSar   = input.float(0.3, "Weight · PSAR (0 disables)",    minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+entryScore  = input.float(30, "Entry score threshold",     minval = 10, maxval = 70, step = 1, group = grpScore, tooltip = "Signal fires when the score CROSSES this level in the permitted direction at bar close.")
+strongScore = input.float(55, "Strong-signal score",       minval = 30, maxval = 90, step = 1, group = grpScore)
+exitScore   = input.float(10, "Score-fade exit level",     minval = 0,  maxval = 40, step = 1, group = grpScore, tooltip = "Momentum-deterioration exit: score crossing back below +exitScore (long) / above -exitScore (short).")
+
+// — 5 · Quality & false-signal filters
+minAtrPct  = input.float(20,  "Min ATR percentile",              minval = 0, maxval = 100, group = grpQ, tooltip = "Skip dead tape: ATR in the bottom quintile of its rolling range is treated as untradeable chop.")
+maxAtrPct  = input.float(95,  "Max ATR percentile",              minval = 0, maxval = 100, group = grpQ, tooltip = "Skip panic conditions: extreme ATR makes stops and fills unreliable.")
+minBbwPct  = input.float(10,  "Min BB-width percentile",         minval = 0, maxval = 100, group = grpQ)
+spreadTicks   = input.int(1,     "Assumed cost (ticks, one side)", minval = 0, maxval = 50, group = grpQ, tooltip = "Your spread + slippage estimate per side, in ticks. 0 disables cost gates. This is a PROXY: Pine cannot observe live bid/ask spread; set it conservatively (CFTC 4.41 warns hypothetical results ignore such frictions).")
+atrSpreadMult = input.float(3.0, "Min ATR ÷ cost",                 minval = 1, maxval = 20, group = grpQ, tooltip = "ATR must exceed cost × this multiple, or the trade cannot pay for itself.")
+stopCostMult  = input.float(5.0, "Min stop distance ÷ cost",       minval = 1, maxval = 50, group = grpQ, tooltip = "Initial stop distance must exceed cost × this multiple so 1 tick of extra slippage stays a small fraction of risk.")
+cooldownBars  = input.int(5,     "Cooldown bars between signals",  minval = 0, maxval = 100, group = grpQ)
+requireCandle = input.bool(true, "Require confirmation candle",    group = grpQ, tooltip = "Close beyond open and in the signal half of the bar's range.")
+requireMomTurn= input.bool(true, "Require momentum turn",          group = grpQ, tooltip = "mom > mom[1] for buys, mom < mom[1] for sells — independent timing evidence.")
+blockTransition = input.bool(true, "Block signals in TRANSITION regime", group = grpQ)
+
+// — 6 · Session filter
+useSession = input.bool(false, "Enable session filter", group = grpSess, tooltip = "OFF by default so the system is testable on 24h markets. Enable for equities/futures; validate per session before hard-coding anything (Part 10, Stage 7).")
+sessStr    = input.session("0700-1900", "Session", group = grpSess)
+sessTzOpt  = input.string("Exchange", "Session timezone", options = ["Exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"], group = grpSess)
+
+// — 7 · Risk reference (indicator shows/echoes these; strategy enforces them)
+stopMult = input.float(1.5, "Suggested stop  = ATR ×",  minval = 0.5, maxval = 6.0, step = 0.25, group = grpRiskD)
+rrRatio  = input.float(1.5, "Suggested target = risk × (R:R)", minval = 0.5, maxval = 5.0, step = 0.25, group = grpRiskD)
+
+// — 8 · Display
+showTable       = input.bool(true,  "Show info table",          group = grpUI)
+showRegimeBG    = input.bool(true,  "Show regime background",   group = grpUI)
+showScoreSmooth = input.bool(true,  "Show smoothed score line", group = grpUI)
+showComponents  = input.bool(false, "Show component sub-scores",group = grpUI)
+
+// =============================================================================
+// ============================ SIGNAL CORE — BEGIN ============================
+// (keep byte-identical with ultimate_1m_strategy.pine)
+// =============================================================================
+
+// ---- helpers ----------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+// Rolling 0..100 percentile-style rank via range position (cheap, deterministic)
+f_rank(float src, int len) =>
+    float hi = ta.highest(src, len)
+    float lo = ta.lowest(src, len)
+    float rng = hi - lo
+    rng > 0 ? 100.0 * (src - lo) / rng : 50.0
+
+// ---- base series ------------------------------------------------------------
+float rsi    = ta.rsi(close, rsiLen)
+float basis  = ta.sma(close, bbLen)
+float dev    = bbMult * ta.stdev(close, bbLen)
+float upperBB = basis + dev
+float lowerBB = basis - dev
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+float mom    = ta.mom(close, momLen)
+float atr    = ta.atr(atrLen)
+float psar   = ta.sar(psarStart, psarInc, psarMax)
+
+// ---- higher-timeframe bias: CONFIRMED value of last closed HTF bar ----------
+// Documented non-repainting pattern: expr[1] + lookahead_on. Guard: HTF must be
+// higher than chart TF.
+if useHTF and timeframe.in_seconds() >= timeframe.in_seconds(htfTf)
+    runtime.error("U1M: HTF timeframe must be higher than the chart timeframe.")
+float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+
+// ---- normalized components, each bounded to [-1, +1] ------------------------
+float atrSafe = atr > 0 ? atr : na
+float cTrend = not na(atrSafe) ? f_clamp((emaFast - emaSlow) / atrSafe, -1.0, 1.0) : 0.0                     // EMA spread in ATR units
+float cSlope = not na(atrSafe) ? f_clamp((emaSlow - emaSlow[5]) / (5.0 * atrSafe), -1.0, 1.0) : 0.0          // slow-EMA slope in ATR units / bar
+float cMom   = not na(atrSafe) ? f_clamp(mom / atrSafe, -1.0, 1.0) : 0.0                                     // momentum in ATR units
+float cRsi   = f_clamp((rsi - 50.0) / 25.0, -1.0, 1.0)                                                       // RSI centered & rescaled
+float cBand  = not na(dev) and dev > 0 ? f_clamp((close - basis) / dev, -1.0, 1.0) : 0.0                     // band position (+1 = upper band)
+float cSar   = psar < close ? 1.0 : -1.0                                                                     // PSAR state (binary, low weight)
+
+// ---- regime engine ----------------------------------------------------------
+float trendMix = f_clamp((math.abs(cTrend) + math.abs(cSlope)) / trendDiv, 0.0, 1.0)
+bool  isTrending   = trendMix >= trendMixTh
+bool  isTransition = not isTrending and trendMix >= transLo
+string regimeStr = isTrending ? (cTrend >= 0 ? "TREND UP" : "TREND DOWN") : isTransition ? "TRANSITION" : "RANGE"
+
+float atrPct = f_rank(atr, volLookback)
+float bbw    = not na(basis) and basis > 0 ? (upperBB - lowerBB) / basis : na
+float bbwPct = f_rank(bbw, bbwLookback)
+bool  volOk  = atrPct >= minAtrPct and atrPct <= maxAtrPct
+bool  bbwOk  = bbwPct >= minBbwPct
+string volStr = bbwPct <= squeezeTh ? "SQUEEZE" : atrPct >= volHighTh ? "HIGH VOL" : atrPct <= volLowTh ? "LOW VOL" : "NORMAL"
+
+// ---- Layer B · directional bias --------------------------------------------
+bool htfLongOk  = not useHTF or close > htfEma   // vs last CONFIRMED HTF EMA
+bool htfShortOk = not useHTF or close < htfEma
+bool biasLongOk  = (isTrending ? cTrend > 0 : true) and htfLongOk
+bool biasShortOk = (isTrending ? cTrend < 0 : true) and htfShortOk
+
+// ---- Layer C+D · composite score: regime-weighted blend --------------------
+// TREND interpretation: trend/momentum/band-position all align with direction.
+// RANGE interpretation: mean reversion — oversold/below-band is bullish.
+// PSAR excluded from RANGE score (trend information is noise in ranges).
+float sTrend = wTrend * cTrend + wSlope * cSlope + wMom * cMom + wRsi * cRsi + wBand * cBand + wSar * cSar
+float sRange = wRsi * (-cRsi) + wBand * (-cBand)
+float wTrendTot = wTrend + wSlope + wMom + wRsi + wBand + wSar
+float wRangeTot = wRsi + wBand
+float wTotal = trendMix * wTrendTot + (1.0 - trendMix) * wRangeTot
+int   warmupBars = math.max(math.max(math.max(math.max(rsiLen, bbLen), math.max(emaFastLen, emaSlowLen)), math.max(math.max(momLen, atrLen), math.max(volLookback, bbwLookback))), useHTF ? htfLen : 0) + 5
+bool  warmOk = bar_index >= warmupBars
+float score = warmOk and wTotal > 0 and not na(sTrend) and not na(sRange) ? 100.0 * (trendMix * sTrend + (1.0 - trendMix) * sRange) / wTotal : 0.0
+float scoreSmooth = ta.wma(score, 3)
+
+// ---- confidence: share of component WEIGHT agreeing with score direction ---
+// This is a composite agreement score, NOT a calibrated probability.
+float dirSign = score > 0 ? 1.0 : score < 0 ? -1.0 : 0.0
+float agreeW = (math.sign(cTrend) == dirSign ? wTrend : 0.0) + (math.sign(cSlope) == dirSign ? wSlope : 0.0) + (math.sign(cMom) == dirSign ? wMom : 0.0) + (math.sign(cRsi) == dirSign ? wRsi : 0.0) + (math.sign(cBand) == dirSign ? wBand : 0.0) + (dirSign != 0 and cSar == dirSign ? wSar : 0.0)
+float conf = warmOk and wTrendTot > 0 ? 100.0 * agreeW / wTrendTot : 0.0
+
+// ---- Layer D · confirmations ------------------------------------------------
+bool confirmUp = (not requireCandle or (close > open and close >= hl2)) and (not requireMomTurn or mom > mom[1])
+bool confirmDn = (not requireCandle or (close < open and close <= hl2)) and (not requireMomTurn or mom < mom[1])
+
+// ---- Layer F · cost proxy gates ---------------------------------------------
+float atrTicks    = not na(atrSafe) and syminfo.mintick > 0 ? atrSafe / syminfo.mintick : na
+bool  costAtrOk   = spreadTicks == 0 or (not na(atrTicks) and atrTicks >= spreadTicks * atrSpreadMult)
+float stopTicksEst = not na(atrSafe) and syminfo.mintick > 0 ? atrSafe * stopMult / syminfo.mintick : na
+bool  costStopOk  = spreadTicks == 0 or (not na(stopTicksEst) and stopTicksEst >= spreadTicks * stopCostMult)
+bool  costOk      = costAtrOk and costStopOk
+
+// ---- session gate -----------------------------------------------------------
+string sessTz = sessTzOpt == "Exchange" ? syminfo.timezone : sessTzOpt
+bool  inSess  = not useSession or not na(time(timeframe.period, sessStr, sessTz))
+
+// ---- Layer E · triggers (bar-close events) ----------------------------------
+var int lastSigBar = -1000000
+bool cooldownOk = bar_index - lastSigBar >= cooldownBars
+bool regimeOk   = not (blockTransition and isTransition)
+
+bool buySigRaw  = ta.crossover(score, entryScore) and confirmUp
+bool sellSigRaw = ta.crossunder(score, -entryScore) and confirmDn
+
+bool buySig  = warmOk and regimeOk and biasLongOk  and volOk and bbwOk and costOk and inSess and cooldownOk and buySigRaw
+bool sellSig = warmOk and regimeOk and biasShortOk and volOk and bbwOk and costOk and inSess and cooldownOk and sellSigRaw
+
+if buySig or sellSig
+    lastSigBar := bar_index
+
+bool strongBuy  = buySig  and score >= strongScore
+bool strongSell = sellSig and score <= -strongScore
+
+// ---- momentum-deterioration exits (informational in the indicator) ----------
+bool fadeExitLong  = ta.crossunder(score, exitScore)
+bool fadeExitShort = ta.crossover(score, -exitScore)
+
+// ---- suggested risk levels for alerts/table ---------------------------------
+float sugStopDist = not na(atrSafe) ? atrSafe * stopMult : na
+// ============================= SIGNAL CORE — END =============================
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// OSCILLATOR UI
+// -----------------------------------------------------------------------------
+color colBull    = color.new(#26a69a, 0)
+color colBear    = color.new(#ef5350, 0)
+color colNeutral = color.new(color.gray, 30)
+
+color scoreCol = score >= strongScore ? colBull : score >= entryScore ? color.new(colBull, 45) : score <= -strongScore ? colBear : score <= -entryScore ? color.new(colBear, 45) : colNeutral
+plot(score, "Composite score", style = plot.style_columns, color = scoreCol)
+plot(showScoreSmooth ? scoreSmooth : na, "Score (smoothed)", color = color.new(color.white, 35), linewidth = 1)
+
+// optional component sub-scores (debug/ablation aid)
+pComp = 100.0
+plot(showComponents ? cTrend * pComp : na, "cTrend", color.new(color.teal, 40), 1)
+plot(showComponents ? cRsi * pComp : na, "cRsi", color.new(color.orange, 40), 1)
+plot(showComponents ? cBand * pComp : na, "cBand", color.new(color.purple, 40), 1)
+
+hline(100, "+100", color.new(color.gray, 70))
+hline(-100, "-100", color.new(color.gray, 70))
+hline(strongScore, "Strong +", color.new(colBull, 60), hline.style_dotted)
+hline(-strongScore, "Strong −", color.new(colBear, 60), hline.style_dotted)
+hline(entryScore, "Entry +", color.new(colBull, 75), hline.style_dashed)
+hline(-entryScore, "Entry −", color.new(colBear, 75), hline.style_dashed)
+hline(0, "Neutral", color.new(color.gray, 55))
+
+plotshape(buySig, "BUY", shape.triangleup, location.bottom, color = strongBuy ? colBull : color.new(colBull, 45), size = size.tiny)
+plotshape(sellSig, "SELL", shape.triangledown, location.top, color = strongSell ? colBear : color.new(colBear, 45), size = size.tiny)
+plotshape(fadeExitLong, "Fade exit ↑", shape.xcross, location.bottom, color = color.new(color.gray, 20), size = size.tiny)
+plotshape(fadeExitShort, "Fade exit ↓", shape.xcross, location.top, color = color.new(color.gray, 20), size = size.tiny)
+
+bgcolor(showRegimeBG ? (isTrending ? color.new(cTrend >= 0 ? color.green : color.red, 92) : isTransition ? color.new(color.orange, 93) : color.new(color.blue, 94)) : na, title = "Regime")
+
+// -----------------------------------------------------------------------------
+// INFO TABLE
+// -----------------------------------------------------------------------------
+var table tbl = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 15), frame_width = 1, frame_color = color.new(color.gray, 50), border_width = 1, border_color = color.new(color.gray, 70))
+if showTable and barstate.islast
+    color txt = color.white
+    table.cell(tbl, 0, 0, "U1M", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, regimeStr, text_color = isTrending ? (cTrend >= 0 ? colBull : colBear) : color.orange, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 1, "Score", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 1, str.tostring(score, "#.0"), text_color = score >= entryScore ? colBull : score <= -entryScore ? colBear : txt, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 2, "Agreement (uncal.)", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(conf, "#") + "%", text_color = txt, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 3, "Volatility", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 3, volStr + " · ATR " + str.tostring(atrPct, "#"), text_color = volOk ? txt : color.orange, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 4, "HTF bias", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 4, not useHTF ? "off" : htfLongOk and not htfShortOk ? "LONG ok" : htfShortOk and not htfLongOk ? "SHORT ok" : "both", text_color = txt, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 5, "Cost gate", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 5, spreadTicks == 0 ? "n/a" : costOk ? "OK" : "FAIL", text_color = spreadTicks == 0 or costOk ? txt : color.red, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 6, "Session", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 6, not useSession ? "n/a" : inSess ? "OPEN" : "CLOSED", text_color = not useSession or inSess ? txt : color.orange, text_size = size.small, text_halign = text.align_right)
+    table.cell(tbl, 0, 7, "Sugg. stop / tgt", text_color = txt, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 7, not na(sugStopDist) ? str.tostring(sugStopDist / syminfo.mintick, "#") + "t / " + str.tostring(sugStopDist * rrRatio / syminfo.mintick, "#") + "t" : "—", text_color = txt, text_size = size.small, text_halign = text.align_right)
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// Classic alertcondition(): select "Once Per Bar Close" when creating alerts.
+// Dynamic alert(): fired only on confirmed bars, structured payload.
+// -----------------------------------------------------------------------------
+alertcondition(buySig,     "U1M BUY",         "U1M BUY — composite score crossed above entry threshold at bar close.")
+alertcondition(sellSig,    "U1M SELL",        "U1M SELL — composite score crossed below negative entry threshold at bar close.")
+alertcondition(strongBuy,  "U1M BUY STRONG",  "U1M STRONG BUY — high-conviction crossover at bar close.")
+alertcondition(strongSell, "U1M SELL STRONG", "U1M STRONG SELL — high-conviction crossunder at bar close.")
+alertcondition(fadeExitLong,  "U1M EXIT LONG (fade)",  "U1M momentum-deterioration: score faded below exit level — review longs.")
+alertcondition(fadeExitShort, "U1M EXIT SHORT (fade)", "U1M momentum-deterioration: score rose above negative exit level — review shorts.")
+alertcondition(isTrending and not isTrending[1] or isTransition and not isTransition[1], "U1M REGIME CHANGE", "U1M regime state changed at bar close.")
+
+string tfStr = timeframe.period
+string alertPayload(string sig) =>
+    '{"sys":"U1M","sym":"' + syminfo.ticker + '","tf":"' + tfStr + '","sig":"' + sig + '","score":' + str.tostring(score, "#.0") + ',"conf":' + str.tostring(conf, "#") + ',"regime":"' + regimeStr + '","vol":"' + volStr + '","px":' + str.tostring(close, format.mintick) + ',"atr":' + str.tostring(atr, format.mintick) + ',"stop":' + str.tostring(buySig or sellSig ? (buySig ? close - sugStopDist : close + sugStopDist) : na, format.mintick) + ',"target":' + str.tostring(buySig or sellSig ? (buySig ? close + sugStopDist * rrRatio : close - sugStopDist * rrRatio) : na, format.mintick) + ',"t":' + str.tostring(time) + '}'
+
+if barstate.isconfirmed
+    if buySig
+        alert(alertPayload("BUY"), alert.freq_once_per_bar_close)
+    if sellSig
+        alert(alertPayload("SELL"), alert.freq_once_per_bar_close)
+    if fadeExitLong
+        alert(alertPayload("EXIT_LONG_FADE"), alert.freq_once_per_bar_close)
+    if fadeExitShort
+        alert(alertPayload("EXIT_SHORT_FADE"), alert.freq_once_per_bar_close)

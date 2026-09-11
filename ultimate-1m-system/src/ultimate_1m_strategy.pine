@@ -1,0 +1,379 @@
+//@version=6
+// =============================================================================
+//  ULTIMATE 1-MINUTE TRADING SYSTEM — VERSION B: STRATEGY (BACKTEST/RESEARCH)
+//  Companion to ultimate_1m_oscillator.pine. The SIGNAL CORE block is shared
+//  byte-for-byte between the two files — keep them synchronized.
+//
+//  EXECUTION MODEL (realistic by construction)
+//    * calc_on_every_tick   = false : decisions only on closed bars.
+//    * process_orders_on_close = false : market orders placed on a bar-close
+//      signal FILL AT THE NEXT BAR OPEN (+ slippage ticks, - commission).
+//      This mirrors what a live trader reacting to a bar-close alert achieves.
+//    * stop/limit exit orders are resting orders; the broker emulator fills
+//      them intrabar. Enable use_bar_magnifier (Premium) for finer intrabar
+//      fill assumptions. Note: when a bar's range could hit BOTH stop and
+//      target, the emulator's intrabar assumption may flatter or penalize
+//      results — treat small-R targets on 1m bars with suspicion and stress
+//      test (DELIVERABLE.md Part 10, Stage 8).
+//    * Costs: commission_value and slippage are set in the declaration below
+//      (Pine requires declaration-level constants — edit them there).
+//
+//  NO PERFORMANCE CLAIMS. Defaults are literature-standard starting points.
+//  Run the validation protocol in DELIVERABLE.md Part 10 before trusting any
+//  result. Historical performance does not guarantee future results.
+// =============================================================================
+
+strategy("Ultimate 1M System — Strategy [Research]", "U1M-STRAT", overlay = true,
+     initial_capital = 25000,
+     currency = currency.USD,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.05,              // EDIT: realistic taker fee per side
+     slippage = 2,                         // EDIT: ticks of slippage per fill
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     calc_on_every_tick = false,
+     process_orders_on_close = false,
+     close_entries_rule = "FIFO",
+     margin_long = 100,                    // cash-backed by default; lower ONLY
+     margin_short = 100,                   // together with the Max leverage input
+     use_bar_magnifier = false,            // enable on Premium for finer fills
+     max_labels_count = 100,
+     max_bars_back = 2000)
+
+// -----------------------------------------------------------------------------
+// INPUTS — groups 1..8 identical to the oscillator (SIGNAL CORE sync)
+// -----------------------------------------------------------------------------
+string grpCore  = "1 · Core indicator lengths"
+string grpReg   = "2 · Regime engine"
+string grpHTF   = "3 · Higher-timeframe bias (confirmed)"
+string grpScore = "4 · Scoring engine"
+string grpQ     = "5 · Quality & false-signal filters"
+string grpSess  = "6 · Session filter"
+string grpRisk  = "7 · Risk management (strategy enforces)"
+string grpSize  = "8 · Position sizing"
+string grpUI    = "9 · Display"
+
+rsiLen     = input.int(14,    "RSI length",                    minval = 2,   maxval = 100, group = grpCore)
+bbLen      = input.int(20,    "Bollinger length",              minval = 5,   maxval = 200, group = grpCore)
+bbMult     = input.float(2.0, "Bollinger stdev multiplier",    minval = 0.5, maxval = 5.0, step = 0.1, group = grpCore)
+emaFastLen = input.int(21,    "Fast EMA length",               minval = 2,   maxval = 400, group = grpCore)
+emaSlowLen = input.int(55,    "Slow EMA length",               minval = 5,   maxval = 800, group = grpCore)
+momLen     = input.int(10,    "Momentum length",               minval = 2,   maxval = 100, group = grpCore)
+atrLen     = input.int(14,    "ATR length",                    minval = 2,   maxval = 200, group = grpCore)
+psarStart  = input.float(0.02,"PSAR start",                    minval = 0.005, maxval = 0.1,  step = 0.005, group = grpCore)
+psarInc    = input.float(0.02,"PSAR increment",                minval = 0.005, maxval = 0.1,  step = 0.005, group = grpCore)
+psarMax    = input.float(0.2, "PSAR maximum",                  minval = 0.05,  maxval = 0.5,  step = 0.01,  group = grpCore)
+
+trendDiv   = input.float(1.6, "Trend-strength divisor (ATR units)", minval = 0.5, maxval = 4.0, step = 0.1, group = grpReg)
+trendMixTh = input.float(0.50,"Trend-mode threshold",               minval = 0.2, maxval = 0.9, step = 0.05, group = grpReg)
+transLo    = input.float(0.35,"Transition-zone lower bound",        minval = 0.0, maxval = 0.8, step = 0.05, group = grpReg)
+volLookback  = input.int(200, "ATR percentile lookback",       minval = 50, maxval = 1000, group = grpReg)
+bbwLookback  = input.int(200, "BB-width percentile lookback",  minval = 50, maxval = 1000, group = grpReg)
+volHighTh    = input.float(80,"High-volatility percentile",    minval = 50, maxval = 100, group = grpReg)
+volLowTh     = input.float(25,"Low-volatility percentile",     minval = 0,  maxval = 60,  group = grpReg)
+squeezeTh    = input.float(15,"Squeeze percentile (BB width)", minval = 0,  maxval = 50,  group = grpReg)
+
+useHTF = input.bool(true, "Use confirmed HTF bias filter", group = grpHTF)
+htfTf  = input.timeframe("15", "HTF timeframe",            group = grpHTF)
+htfLen = input.int(50,        "HTF EMA length",            minval = 2, maxval = 400, group = grpHTF)
+
+wTrend = input.float(1.0, "Weight · trend (EMA spread)",   minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wSlope = input.float(0.5, "Weight · MA slope",             minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wMom   = input.float(0.5, "Weight · momentum",             minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wRsi   = input.float(0.7, "Weight · RSI",                  minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wBand  = input.float(0.6, "Weight · band position",        minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+wSar   = input.float(0.3, "Weight · PSAR (0 disables)",    minval = 0.0, maxval = 3.0, step = 0.05, group = grpScore)
+entryScore  = input.float(30, "Entry score threshold",     minval = 10, maxval = 70, step = 1, group = grpScore)
+strongScore = input.float(55, "Strong-signal score",       minval = 30, maxval = 90, step = 1, group = grpScore)
+exitScore   = input.float(10, "Score-fade exit level",     minval = 0,  maxval = 40, step = 1, group = grpScore)
+
+minAtrPct  = input.float(20,  "Min ATR percentile",              minval = 0, maxval = 100, group = grpQ)
+maxAtrPct  = input.float(95,  "Max ATR percentile",              minval = 0, maxval = 100, group = grpQ)
+minBbwPct  = input.float(10,  "Min BB-width percentile",         minval = 0, maxval = 100, group = grpQ)
+spreadTicks   = input.int(1,     "Assumed cost (ticks, one side)", minval = 0, maxval = 50, group = grpQ)
+atrSpreadMult = input.float(3.0, "Min ATR ÷ cost",                 minval = 1, maxval = 20, group = grpQ)
+stopCostMult  = input.float(5.0, "Min stop distance ÷ cost",       minval = 1, maxval = 50, group = grpQ)
+cooldownBars  = input.int(5,     "Cooldown bars between signals",  minval = 0, maxval = 100, group = grpQ)
+requireCandle = input.bool(true, "Require confirmation candle",    group = grpQ)
+requireMomTurn= input.bool(true, "Require momentum turn",          group = grpQ)
+blockTransition = input.bool(true, "Block signals in TRANSITION regime", group = grpQ)
+
+useSession = input.bool(false, "Enable session filter", group = grpSess)
+sessStr    = input.session("0700-1900", "Session", group = grpSess)
+sessTzOpt  = input.string("Exchange", "Session timezone", options = ["Exchange", "UTC", "America/New_York", "Europe/London", "Asia/Tokyo"], group = grpSess)
+
+// stopMult/rrRatio are SHARED names used by the signal core's cost gates and by
+// the exit brackets — indicator display and strategy execution cannot disagree.
+stopMult  = input.float(1.5, "Stop distance  = ATR ×",     minval = 0.5, maxval = 6.0, step = 0.25, group = grpRisk)
+rrRatio   = input.float(1.5, "Target = risk × (R:R)",      minval = 0.5, maxval = 5.0, step = 0.25, group = grpRisk)
+useBE       = input.bool(true,  "Move stop to break-even",       group = grpRisk)
+beAtR       = input.float(1.0,  "Break-even after (R)",          minval = 0.25, maxval = 3.0, step = 0.25, group = grpRisk)
+beOffsetTicks = input.int(1,    "Break-even offset (ticks)",     minval = 0, maxval = 50, group = grpRisk)
+useTrail    = input.bool(true,  "ATR trailing stop",             group = grpRisk)
+trailMult   = input.float(2.0,  "Trail distance = ATR ×",        minval = 0.5, maxval = 6.0, step = 0.25, group = grpRisk)
+trailAfterR = input.float(1.0,  "Activate trail after (R)",      minval = 0.0, maxval = 3.0, step = 0.25, group = grpRisk)
+useTimeStop = input.bool(false, "Time stop (bars)",              group = grpRisk)
+timeStopBars= input.int(60,     "Time stop length (bars)",       minval = 5, maxval = 1000, group = grpRisk)
+exitOnFade  = input.bool(true,  "Exit on score-fade (momentum deterioration)", group = grpRisk)
+flatAtSessionEnd = input.bool(true, "Flatten at session end (needs session filter)", group = grpRisk)
+
+sizingMode = input.string("Risk % of equity", "Position sizing", options = ["Risk % of equity", "Fixed quantity"], group = grpSize)
+riskPct    = input.float(0.5, "Risk per trade (% equity)",     minval = 0.05, maxval = 5.0, step = 0.05, group = grpSize, tooltip = "Position sized so that a stop-out loses this % of current equity. Clamped by Max leverage.")
+fixedQty   = input.float(1.0, "Fixed quantity",                minval = 0.0, group = grpSize)
+maxLev     = input.float(1.0, "Max notional leverage vs equity", minval = 0.1, maxval = 20.0, step = 0.1, group = grpSize, tooltip = "Hard cap on notional exposure. Keep ≤ 1 for spot-like testing; margin_long/short in the declaration must be ≥ 100/maxLev.")
+
+showShapes = input.bool(true, "Show entry/exit markers", group = grpUI)
+showLines  = input.bool(true, "Show live stop/target lines", group = grpUI)
+showRegimeBG = input.bool(false, "Show regime background", group = grpUI)
+
+// =============================================================================
+// ============================ SIGNAL CORE — BEGIN ============================
+// (keep byte-identical with ultimate_1m_oscillator.pine)
+// =============================================================================
+
+// ---- helpers ----------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+// Rolling 0..100 percentile-style rank via range position (cheap, deterministic)
+f_rank(float src, int len) =>
+    float hi = ta.highest(src, len)
+    float lo = ta.lowest(src, len)
+    float rng = hi - lo
+    rng > 0 ? 100.0 * (src - lo) / rng : 50.0
+
+// ---- base series ------------------------------------------------------------
+float rsi    = ta.rsi(close, rsiLen)
+float basis  = ta.sma(close, bbLen)
+float dev    = bbMult * ta.stdev(close, bbLen)
+float upperBB = basis + dev
+float lowerBB = basis - dev
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+float mom    = ta.mom(close, momLen)
+float atr    = ta.atr(atrLen)
+float psar   = ta.sar(psarStart, psarInc, psarMax)
+
+// ---- higher-timeframe bias: CONFIRMED value of last closed HTF bar ----------
+if useHTF and timeframe.in_seconds() >= timeframe.in_seconds(htfTf)
+    runtime.error("U1M: HTF timeframe must be higher than the chart timeframe.")
+float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen)[1], lookahead = barmerge.lookahead_on)
+
+// ---- normalized components, each bounded to [-1, +1] ------------------------
+float atrSafe = atr > 0 ? atr : na
+float cTrend = not na(atrSafe) ? f_clamp((emaFast - emaSlow) / atrSafe, -1.0, 1.0) : 0.0
+float cSlope = not na(atrSafe) ? f_clamp((emaSlow - emaSlow[5]) / (5.0 * atrSafe), -1.0, 1.0) : 0.0
+float cMom   = not na(atrSafe) ? f_clamp(mom / atrSafe, -1.0, 1.0) : 0.0
+float cRsi   = f_clamp((rsi - 50.0) / 25.0, -1.0, 1.0)
+float cBand  = not na(dev) and dev > 0 ? f_clamp((close - basis) / dev, -1.0, 1.0) : 0.0
+float cSar   = psar < close ? 1.0 : -1.0
+
+// ---- regime engine ----------------------------------------------------------
+float trendMix = f_clamp((math.abs(cTrend) + math.abs(cSlope)) / trendDiv, 0.0, 1.0)
+bool  isTrending   = trendMix >= trendMixTh
+bool  isTransition = not isTrending and trendMix >= transLo
+string regimeStr = isTrending ? (cTrend >= 0 ? "TREND UP" : "TREND DOWN") : isTransition ? "TRANSITION" : "RANGE"
+
+float atrPct = f_rank(atr, volLookback)
+float bbw    = not na(basis) and basis > 0 ? (upperBB - lowerBB) / basis : na
+float bbwPct = f_rank(bbw, bbwLookback)
+bool  volOk  = atrPct >= minAtrPct and atrPct <= maxAtrPct
+bool  bbwOk  = bbwPct >= minBbwPct
+string volStr = bbwPct <= squeezeTh ? "SQUEEZE" : atrPct >= volHighTh ? "HIGH VOL" : atrPct <= volLowTh ? "LOW VOL" : "NORMAL"
+
+// ---- Layer B · directional bias --------------------------------------------
+bool htfLongOk  = not useHTF or close > htfEma
+bool htfShortOk = not useHTF or close < htfEma
+bool biasLongOk  = (isTrending ? cTrend > 0 : true) and htfLongOk
+bool biasShortOk = (isTrending ? cTrend < 0 : true) and htfShortOk
+
+// ---- Layer C+D · composite score: regime-weighted blend --------------------
+float sTrend = wTrend * cTrend + wSlope * cSlope + wMom * cMom + wRsi * cRsi + wBand * cBand + wSar * cSar
+float sRange = wRsi * (-cRsi) + wBand * (-cBand)
+float wTrendTot = wTrend + wSlope + wMom + wRsi + wBand + wSar
+float wRangeTot = wRsi + wBand
+float wTotal = trendMix * wTrendTot + (1.0 - trendMix) * wRangeTot
+int   warmupBars = math.max(math.max(math.max(math.max(rsiLen, bbLen), math.max(emaFastLen, emaSlowLen)), math.max(math.max(momLen, atrLen), math.max(volLookback, bbwLookback))), useHTF ? htfLen : 0) + 5
+bool  warmOk = bar_index >= warmupBars
+float score = warmOk and wTotal > 0 and not na(sTrend) and not na(sRange) ? 100.0 * (trendMix * sTrend + (1.0 - trendMix) * sRange) / wTotal : 0.0
+float scoreSmooth = ta.wma(score, 3)
+
+// ---- confidence -------------------------------------------------------------
+float dirSign = score > 0 ? 1.0 : score < 0 ? -1.0 : 0.0
+float agreeW = (math.sign(cTrend) == dirSign ? wTrend : 0.0) + (math.sign(cSlope) == dirSign ? wSlope : 0.0) + (math.sign(cMom) == dirSign ? wMom : 0.0) + (math.sign(cRsi) == dirSign ? wRsi : 0.0) + (math.sign(cBand) == dirSign ? wBand : 0.0) + (dirSign != 0 and cSar == dirSign ? wSar : 0.0)
+float conf = warmOk and wTrendTot > 0 ? 100.0 * agreeW / wTrendTot : 0.0
+
+// ---- Layer D · confirmations ------------------------------------------------
+bool confirmUp = (not requireCandle or (close > open and close >= hl2)) and (not requireMomTurn or mom > mom[1])
+bool confirmDn = (not requireCandle or (close < open and close <= hl2)) and (not requireMomTurn or mom < mom[1])
+
+// ---- Layer F · cost proxy gates ---------------------------------------------
+float atrTicks    = not na(atrSafe) and syminfo.mintick > 0 ? atrSafe / syminfo.mintick : na
+bool  costAtrOk   = spreadTicks == 0 or (not na(atrTicks) and atrTicks >= spreadTicks * atrSpreadMult)
+float stopTicksEst = not na(atrSafe) and syminfo.mintick > 0 ? atrSafe * stopMult / syminfo.mintick : na
+bool  costStopOk  = spreadTicks == 0 or (not na(stopTicksEst) and stopTicksEst >= spreadTicks * stopCostMult)
+bool  costOk      = costAtrOk and costStopOk
+
+// ---- session gate -----------------------------------------------------------
+string sessTz = sessTzOpt == "Exchange" ? syminfo.timezone : sessTzOpt
+bool  inSess  = not useSession or not na(time(timeframe.period, sessStr, sessTz))
+
+// ---- Layer E · triggers -----------------------------------------------------
+var int lastSigBar = -1000000
+bool cooldownOk = bar_index - lastSigBar >= cooldownBars
+bool regimeOk   = not (blockTransition and isTransition)
+
+bool buySigRaw  = ta.crossover(score, entryScore) and confirmUp
+bool sellSigRaw = ta.crossunder(score, -entryScore) and confirmDn
+
+bool buySig  = warmOk and regimeOk and biasLongOk  and volOk and bbwOk and costOk and inSess and cooldownOk and buySigRaw
+bool sellSig = warmOk and regimeOk and biasShortOk and volOk and bbwOk and costOk and inSess and cooldownOk and sellSigRaw
+
+if buySig or sellSig
+    lastSigBar := bar_index
+
+bool strongBuy  = buySig  and score >= strongScore
+bool strongSell = sellSig and score <= -strongScore
+
+// ---- momentum-deterioration exits -------------------------------------------
+bool fadeExitLong  = ta.crossunder(score, exitScore)
+bool fadeExitShort = ta.crossover(score, -exitScore)
+
+// ---- suggested risk levels (executed as brackets below) ---------------------
+float sugStopDist = not na(atrSafe) ? atrSafe * stopMult : na
+// ============================= SIGNAL CORE — END =============================
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// POSITION SIZING (signal generation and risk management are kept separate)
+// -----------------------------------------------------------------------------
+float stopDist = not na(atrSafe) ? atrSafe * stopMult : na
+float riskCash = strategy.equity * riskPct / 100.0
+float qtyRisk  = not na(stopDist) and stopDist > 0 ? riskCash / stopDist : 0.0
+float qtyCap   = close > 0 ? strategy.equity * maxLev / close : 0.0
+float posQty   = sizingMode == "Risk % of equity" ? math.min(qtyRisk, qtyCap) : fixedQty
+bool  qtyOk    = not na(posQty) and posQty > 0
+
+// -----------------------------------------------------------------------------
+// ORDER MANAGEMENT — bracket state (all updates on confirmed bars)
+// -----------------------------------------------------------------------------
+var float pendStop = na      // bracket set at SIGNAL time (realistic: you would
+var float pendTgt  = na      // place the bracket as soon as the alert fires)
+var float stopPx   = na
+var float tgtPx    = na
+var float initRisk = na      // entry − initial stop (1R), captured once
+var int   entryBar = na
+var int   prevSide = 0
+
+int curSide = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+bool sideChanged = curSide != prevSide
+
+if buySig
+    pendStop := close - atr * stopMult
+    pendTgt  := close + atr * stopMult * rrRatio
+if sellSig
+    pendStop := close + atr * stopMult
+    pendTgt  := close - atr * stopMult * rrRatio
+
+if curSide == 0 or sideChanged
+    stopPx   := na
+    tgtPx    := na
+    initRisk := na
+    entryBar := na
+
+// initialize bracket on the fill bar from the SIGNAL-time bracket levels
+if curSide == 1 and na(stopPx) and not na(pendStop)
+    stopPx   := pendStop
+    tgtPx    := pendTgt
+    initRisk := strategy.position_avg_price - stopPx
+    entryBar := bar_index
+if curSide == -1 and na(stopPx) and not na(pendStop)
+    stopPx   := pendStop
+    tgtPx    := pendTgt
+    initRisk := stopPx - strategy.position_avg_price
+    entryBar := bar_index
+
+// ---- break-even & trailing (ratcheting, confirmed-bar updates only) --------
+if curSide == 1 and not na(initRisk) and not na(stopPx)
+    float ep = strategy.position_avg_price
+    if useBE and high >= ep + beAtR * initRisk
+        stopPx := math.max(stopPx, ep + beOffsetTicks * syminfo.mintick)
+    if useTrail and high >= ep + trailAfterR * initRisk
+        float trailCand = close - atr * trailMult
+        stopPx := math.max(stopPx, trailCand)
+if curSide == -1 and not na(initRisk) and not na(stopPx)
+    float ep = strategy.position_avg_price
+    if useBE and low <= ep - beAtR * initRisk
+        stopPx := math.min(stopPx, ep - beOffsetTicks * syminfo.mintick)
+    if useTrail and low <= ep - trailAfterR * initRisk
+        float trailCand = close + atr * trailMult
+        stopPx := math.min(stopPx, trailCand)
+
+// resting bracket orders (updated each closed bar while in position)
+if curSide == 1
+    strategy.exit("X-Long", "L", stop = stopPx, limit = tgtPx)
+if curSide == -1
+    strategy.exit("X-Short", "S", stop = stopPx, limit = tgtPx)
+
+// ---- time stop ---------------------------------------------------------------
+if useTimeStop and curSide != 0 and not na(entryBar) and bar_index - entryBar >= timeStopBars
+    strategy.close_all(comment = "time-stop")
+
+// ---- score-fade (momentum deterioration) exit --------------------------------
+if exitOnFade and curSide == 1 and fadeExitLong
+    strategy.close("L", comment = "score-fade")
+if exitOnFade and curSide == -1 and fadeExitShort
+    strategy.close("S", comment = "score-fade")
+
+// ---- session-end flat ---------------------------------------------------------
+bool sessEnd = useSession and inSess[1] and not inSess
+if flatAtSessionEnd and sessEnd and curSide != 0
+    strategy.close_all(comment = "session-end")
+
+// ---- entries (full signals only; opposite entry reverses via FIFO netting) ---
+// The stop/target bracket is submitted at SIGNAL time together with the entry,
+// so it protects the position from the fill bar onward — exactly what a live
+// trader placing an OCO bracket after a bar-close alert would do. The per-bar
+// update above ratchets the stop as break-even/trailing engage.
+if buySig and qtyOk
+    strategy.entry("L", strategy.long, qty = posQty, alert_message = "U1M LONG entry")
+    strategy.exit("X-Long", "L", stop = pendStop, limit = pendTgt, alert_message = "U1M LONG exit")
+if sellSig and qtyOk
+    strategy.entry("S", strategy.short, qty = posQty, alert_message = "U1M SHORT entry")
+    strategy.exit("X-Short", "S", stop = pendStop, limit = pendTgt, alert_message = "U1M SHORT exit")
+
+prevSide := curSide
+
+// -----------------------------------------------------------------------------
+// VISUALS
+// -----------------------------------------------------------------------------
+plotshape(showShapes and buySig,  "BUY",  shape.triangleup,   location.belowbar, color.new(color.teal, 0), size = size.tiny)
+plotshape(showShapes and sellSig, "SELL", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+plot(showLines and curSide != 0 ? stopPx : na, "Stop",   color.new(color.red, 0),  2, plot.style_linebr)
+plot(showLines and curSide != 0 ? tgtPx  : na, "Target", color.new(color.teal, 0), 2, plot.style_linebr)
+bgcolor(showRegimeBG ? (isTrending ? color.new(cTrend >= 0 ? color.green : color.red, 92) : isTransition ? color.new(color.orange, 93) : color.new(color.blue, 94)) : na, title = "Regime")
+
+// -----------------------------------------------------------------------------
+// ALERTS — same architecture as the indicator, plus order-fill alert messages
+// -----------------------------------------------------------------------------
+alertcondition(buySig,     "U1M BUY",         "U1M BUY at bar close.")
+alertcondition(sellSig,    "U1M SELL",        "U1M SELL at bar close.")
+alertcondition(strongBuy,  "U1M BUY STRONG",  "U1M STRONG BUY at bar close.")
+alertcondition(strongSell, "U1M SELL STRONG", "U1M STRONG SELL at bar close.")
+alertcondition(fadeExitLong,  "U1M EXIT LONG (fade)",  "U1M long exit: score fade.")
+alertcondition(fadeExitShort, "U1M EXIT SHORT (fade)", "U1M short exit: score fade.")
+
+string tfStr = timeframe.period
+string alertPayload(string sig) =>
+    '{"sys":"U1M","sym":"' + syminfo.ticker + '","tf":"' + tfStr + '","sig":"' + sig + '","score":' + str.tostring(score, "#.0") + ',"conf":' + str.tostring(conf, "#") + ',"regime":"' + regimeStr + '","vol":"' + volStr + '","px":' + str.tostring(close, format.mintick) + ',"atr":' + str.tostring(atr, format.mintick) + ',"stop":' + str.tostring(buySig or sellSig ? (buySig ? close - sugStopDist : close + sugStopDist) : na, format.mintick) + ',"target":' + str.tostring(buySig or sellSig ? (buySig ? close + sugStopDist * rrRatio : close - sugStopDist * rrRatio) : na, format.mintick) + ',"t":' + str.tostring(time) + '}'
+
+if barstate.isconfirmed
+    if buySig
+        alert(alertPayload("BUY"), alert.freq_once_per_bar_close)
+    if sellSig
+        alert(alertPayload("SELL"), alert.freq_once_per_bar_close)
+    if fadeExitLong
+        alert(alertPayload("EXIT_LONG_FADE"), alert.freq_once_per_bar_close)
+    if fadeExitShort
+        alert(alertPayload("EXIT_SHORT_FADE"), alert.freq_once_per_bar_close)
